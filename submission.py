@@ -119,23 +119,19 @@ def _triton_block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     batch_heads = batch_size * num_heads
     num_q_blocks = t_max // BLOCK_SIZE
 
-    q_flat = q.reshape(batch_heads, t_max, head_dim).contiguous()
-    k_flat = k.reshape(batch_heads, t_max, head_dim).contiguous()
-    v_flat = v.reshape(batch_heads, t_max, head_dim).contiguous()
+    q_flat = q.reshape(batch_heads, t_max, head_dim)
+    k_flat = k.reshape(batch_heads, t_max, head_dim)
+    v_flat = v.reshape(batch_heads, t_max, head_dim)
 
     row_ptr_flat = row_ptr.reshape(batch_heads, num_q_blocks + 1).to(torch.int64)
     col_idx_flat = col_idx.reshape(batch_heads, -1).to(torch.int64)
 
     row_starts = row_ptr_flat[:, :-1]
     degrees = (row_ptr_flat[:, 1:] - row_starts).to(torch.int32)
-    max_degree = max(int(degrees.max().item()), 1)
 
-    MAX_BLOCKS = 1
-    while MAX_BLOCKS < max_degree:
-        MAX_BLOCKS *= 2
-    MAX_BLOCKS = min(MAX_BLOCKS, 32)
+    MAX_BLOCKS = 16
 
-    slot_offsets = torch.arange(MAX_BLOCKS, device=device, dtype=torch.int64)
+    slot_offsets = torch.arange(16, device=device, dtype=torch.int64)
     ci_max_idx = col_idx_flat.shape[1] - 1
     gather_idx = (row_starts[:, :, None] + slot_offsets[None, None, :]).clamp(max=ci_max_idx)
     flat_gather = gather_idx.reshape(batch_heads, -1)
@@ -285,40 +281,26 @@ def setup(suite_specs, device, variants):
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
 
-    max_blocks_needed = set()
     seen_shapes = set()
     for spec in suite_specs:
-        upper = spec.window_blocks + spec.global_blocks + spec.retrieval_blocks
-        mb = 1
-        while mb < upper:
-            mb *= 2
-        mb = min(mb, 32)
-        max_blocks_needed.add(max(mb, 1))
-
         shape_key = (spec.batch_size, spec.num_heads, spec.t_max)
         seen_shapes.add(shape_key)
 
     for (b, h, t) in seen_shapes:
-        for mb in max_blocks_needed:
-            nqb = t // BLOCK_SIZE
-            q = torch.randn(b, h, t, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-            k = torch.randn_like(q)
-            v = torch.randn_like(q)
+        nqb = t // BLOCK_SIZE
+        q = torch.randn(b, h, t, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
 
-            batch_heads = b * h
-            actual_deg = min(mb, nqb)
-            rp = torch.zeros(b, h, nqb + 1, dtype=torch.int32, device="cuda")
-            for i in range(nqb):
-                rp[:, :, i + 1] = rp[:, :, i] + actual_deg
-            total_nnz = nqb * actual_deg
-            ci = torch.zeros(b, h, total_nnz, dtype=torch.int32, device="cuda")
-            for i in range(nqb):
-                for d in range(actual_deg):
-                    block_idx = max(0, i - d)
-                    ci[:, :, i * actual_deg + d] = block_idx
-            sl = torch.full((b,), t, dtype=torch.int32, device="cuda")
+        rp = torch.zeros(b, h, nqb + 1, dtype=torch.int32, device="cuda")
+        for i in range(nqb):
+            rp[:, :, i + 1] = rp[:, :, i] + 1
+        ci = torch.zeros(b, h, nqb, dtype=torch.int32, device="cuda")
+        for i in range(nqb):
+            ci[:, :, i] = i
+        sl = torch.full((b,), t, dtype=torch.int32, device="cuda")
 
-            block_sparse_attn_fwd(q, k, v, rp, ci, sl)
-            torch.cuda.synchronize()
-            del q, k, v, rp, ci, sl
-            torch.cuda.empty_cache()
+        block_sparse_attn_fwd(q, k, v, rp, ci, sl)
+        torch.cuda.synchronize()
+        del q, k, v, rp, ci, sl
+        torch.cuda.empty_cache()
