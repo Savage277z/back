@@ -13,90 +13,78 @@ VARIANT_MANIFEST = [
 
 
 @triton.jit
-def _block_sparse_attn_fwd(
+def _block_sparse_attn_fwd_v2(
     Q, K, V, O, LSE,
-    ROW_PTR, COL_IDX, SEQ_LENS,
-    stride_qb, stride_qh, stride_qt, stride_qd,
-    stride_kb, stride_kh, stride_kt, stride_kd,
-    stride_vb, stride_vh, stride_vt, stride_vd,
-    stride_ob, stride_oh, stride_ot, stride_od,
-    stride_lseb, stride_lseh, stride_lset,
-    stride_rpb, stride_rph, stride_rpn,
-    stride_cib, stride_cih, stride_cin,
-    num_heads,
+    BLOCK_INDICES,
+    DEGREES,
+    SEQ_LENS,
+    t_max,
     num_q_blocks,
-    max_nnz,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    stride_bi_bh, stride_bi_qb, stride_bi_s,
+    stride_deg_bh, stride_deg_qb,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
     SCALE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     bh = pid // num_q_blocks
     qb = pid % num_q_blocks
-    batch_idx = bh // num_heads
-    head_idx = bh % num_heads
 
-    seq_len = tl.load(SEQ_LENS + batch_idx)
-    q_start = qb * BLOCK_M
+    seq_len = tl.load(SEQ_LENS + bh)
+    q_start = qb * BLOCK_SIZE
 
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_D)
+    offs = tl.arange(0, BLOCK_SIZE)
 
-    q_positions = q_start + offs_m
+    bh_base = bh * t_max * BLOCK_SIZE
 
-    o_ptrs = O + batch_idx * stride_ob + head_idx * stride_oh + q_positions[:, None] * stride_ot + offs_d[None, :] * stride_od
-    lse_ptrs = LSE + batch_idx * stride_lseb + head_idx * stride_lseh + q_positions * stride_lset
+    o_ptrs = O + bh_base + (q_start + offs[:, None]) * BLOCK_SIZE + offs[None, :]
+    lse_ptrs = LSE + bh * t_max + q_start + offs
 
     if q_start >= seq_len:
-        tl.store(o_ptrs, tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.bfloat16), mask=(offs_m[:, None] < BLOCK_M) & (offs_d[None, :] < BLOCK_D))
-        tl.store(lse_ptrs, float('-inf') + tl.zeros([BLOCK_M], dtype=tl.float32))
+        tl.store(o_ptrs, tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.bfloat16))
+        tl.store(lse_ptrs, tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32))
         return
 
-    q_ptrs = Q + batch_idx * stride_qb + head_idx * stride_qh + q_positions[:, None] * stride_qt + offs_d[None, :] * stride_qd
-    q_mask = q_positions[:, None] < seq_len
+    num_k = tl.load(DEGREES + bh * stride_deg_bh + qb * stride_deg_qb)
+    if num_k == 0:
+        tl.store(o_ptrs, tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.bfloat16))
+        tl.store(lse_ptrs, tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32))
+        return
+
+    q_ptrs = Q + bh_base + (q_start + offs[:, None]) * BLOCK_SIZE + offs[None, :]
+    q_mask = (q_start + offs[:, None]) < seq_len
     q_block = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
-    rp_base = ROW_PTR + batch_idx * stride_rpb + head_idx * stride_rph
-    row_start = tl.load(rp_base + qb * stride_rpn)
-    row_end = tl.load(rp_base + (qb + 1) * stride_rpn)
+    bi_base = BLOCK_INDICES + bh * stride_bi_bh + qb * stride_bi_qb
 
-    if row_start == row_end:
-        tl.store(o_ptrs, tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.bfloat16), mask=(offs_m[:, None] < BLOCK_M) & (offs_d[None, :] < BLOCK_D))
-        tl.store(lse_ptrs, float('-inf') + tl.zeros([BLOCK_M], dtype=tl.float32))
-        return
+    m_i = tl.full([BLOCK_SIZE], float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.float32)
 
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+    q_positions = q_start + offs
 
-    ci_base = COL_IDX + batch_idx * stride_cib + head_idx * stride_cih
+    for slot in range(MAX_BLOCKS):
+        k_block_idx = tl.load(bi_base + slot * stride_bi_s)
+        k_start = k_block_idx * BLOCK_SIZE
+        k_positions = k_start + offs
 
-    for slot in range(row_start, row_end):
-        k_block = tl.load(ci_base + slot * stride_cin)
-        k_start = k_block * BLOCK_N
-        k_positions = k_start + offs_n
-
-        k_ptrs = K + batch_idx * stride_kb + head_idx * stride_kh + k_positions[:, None] * stride_kt + offs_d[None, :] * stride_kd
-        k_mask = k_positions[:, None] < seq_len
-        k_chunk = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        k_ptrs = K + bh_base + k_positions[:, None] * BLOCK_SIZE + offs[None, :]
+        k_chunk = tl.load(k_ptrs, mask=k_positions[:, None] < seq_len, other=0.0)
 
         s = tl.dot(q_block, tl.trans(k_chunk)).to(tl.float32) * SCALE
 
-        k_valid = k_positions[None, :] < seq_len
-        q_valid = q_positions[:, None] < seq_len
-        mask = k_valid & q_valid
+        valid = (slot < num_k)
+        seq_mask = (q_positions[:, None] < seq_len) & (k_positions[None, :] < seq_len)
+        full_mask = valid & seq_mask
 
-        is_diag = (k_block == qb)
+        is_diag = (k_block_idx == qb)
         if is_diag:
             causal = k_positions[None, :] <= q_positions[:, None]
-            mask = mask & causal
+            full_mask = full_mask & causal
 
-        s = tl.where(mask, s, float('-inf'))
+        s = tl.where(full_mask, s, float('-inf'))
 
         block_max = tl.max(s, axis=1)
-
         new_m = tl.maximum(m_i, block_max)
 
         safe_old_m = tl.where(m_i > float('-inf'), m_i, new_m)
@@ -104,9 +92,9 @@ def _block_sparse_attn_fwd(
 
         safe_new_m = tl.where(new_m > float('-inf'), new_m, 0.0)
         exp_s = tl.exp(s - safe_new_m[:, None])
-        exp_s = tl.where(s > float('-inf'), exp_s, 0.0)
+        exp_s = tl.where(full_mask, exp_s, 0.0)
 
-        v_ptrs = V + batch_idx * stride_vb + head_idx * stride_vh + k_positions[:, None] * stride_vt + offs_d[None, :] * stride_vd
+        v_ptrs = V + bh_base + k_positions[:, None] * BLOCK_SIZE + offs[None, :]
         v_chunk = tl.load(v_ptrs, mask=k_positions[:, None] < seq_len, other=0.0)
 
         acc = acc * alpha[:, None] + tl.dot(exp_s.to(tl.bfloat16), v_chunk).to(tl.float32)
@@ -115,45 +103,64 @@ def _block_sparse_attn_fwd(
 
     valid_l = l_i > 0
     o_val = tl.where(valid_l[:, None], acc / l_i[:, None], 0.0)
-
-    q_out_valid = q_positions[:, None] < seq_len
-    o_val = tl.where(q_out_valid, o_val, 0.0)
-    tl.store(o_ptrs, o_val.to(tl.bfloat16), mask=(offs_m[:, None] < BLOCK_M) & (offs_d[None, :] < BLOCK_D))
+    q_valid = (q_start + offs[:, None]) < seq_len
+    o_val = tl.where(q_valid, o_val, 0.0)
+    tl.store(o_ptrs, o_val.to(tl.bfloat16))
 
     lse_val = tl.where(valid_l, m_i + tl.log(l_i), float('-inf'))
-    q_lse_valid = q_positions < seq_len
+    q_lse_valid = (q_start + offs) < seq_len
     lse_val = tl.where(q_lse_valid, lse_val, float('-inf'))
     tl.store(lse_ptrs, lse_val)
 
 
 def _triton_block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
     batch_size, num_heads, t_max, head_dim = q.shape
+    device = q.device
+    batch_heads = batch_size * num_heads
     num_q_blocks = t_max // BLOCK_SIZE
-    max_nnz = col_idx.shape[-1]
 
-    o = torch.empty_like(q)
-    lse = torch.full((batch_size, num_heads, t_max), float('-inf'),
-                     device=q.device, dtype=torch.float32)
+    q_flat = q.reshape(batch_heads, t_max, head_dim).contiguous()
+    k_flat = k.reshape(batch_heads, t_max, head_dim).contiguous()
+    v_flat = v.reshape(batch_heads, t_max, head_dim).contiguous()
 
-    grid = (batch_size * num_heads * num_q_blocks,)
-    _block_sparse_attn_fwd[grid](
-        q, k, v, o, lse,
-        row_ptr, col_idx, seq_lens,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        lse.stride(0), lse.stride(1), lse.stride(2),
-        row_ptr.stride(0), row_ptr.stride(1), row_ptr.stride(2),
-        col_idx.stride(0), col_idx.stride(1), col_idx.stride(2),
-        num_heads=num_heads,
-        num_q_blocks=num_q_blocks,
-        max_nnz=max_nnz,
-        BLOCK_M=128, BLOCK_N=128, BLOCK_D=128,
-        SCALE=SCALE,
-        num_warps=4, num_stages=2,
+    row_ptr_flat = row_ptr.reshape(batch_heads, num_q_blocks + 1).to(torch.int64)
+    col_idx_flat = col_idx.reshape(batch_heads, -1).to(torch.int64)
+
+    row_starts = row_ptr_flat[:, :-1]
+    degrees = (row_ptr_flat[:, 1:] - row_starts).to(torch.int32)
+    max_degree = max(int(degrees.max().item()), 1)
+
+    MAX_BLOCKS = 1
+    while MAX_BLOCKS < max_degree:
+        MAX_BLOCKS *= 2
+    MAX_BLOCKS = min(MAX_BLOCKS, 32)
+
+    slot_offsets = torch.arange(MAX_BLOCKS, device=device, dtype=torch.int64)
+    ci_max_idx = col_idx_flat.shape[1] - 1
+    gather_idx = (row_starts[:, :, None] + slot_offsets[None, None, :]).clamp(max=ci_max_idx)
+    flat_gather = gather_idx.reshape(batch_heads, -1)
+    block_indices = torch.gather(col_idx_flat, 1, flat_gather).reshape(batch_heads, num_q_blocks, MAX_BLOCKS).to(torch.int32)
+
+    valid_mask = slot_offsets[None, None, :] < degrees[:, :, None].to(torch.int64)
+    block_indices = torch.where(valid_mask, block_indices, torch.zeros_like(block_indices))
+
+    seq_lens_bh = seq_lens[:, None].expand(batch_size, num_heads).reshape(batch_heads).contiguous().to(torch.int32)
+
+    o_flat = torch.empty_like(q_flat)
+    lse_flat = torch.full((batch_heads, t_max), float('-inf'), device=device, dtype=torch.float32)
+
+    grid = (batch_heads * num_q_blocks,)
+    _block_sparse_attn_fwd_v2[grid](
+        q_flat, k_flat, v_flat, o_flat, lse_flat,
+        block_indices, degrees, seq_lens_bh,
+        t_max, num_q_blocks,
+        block_indices.stride(0), block_indices.stride(1), block_indices.stride(2),
+        degrees.stride(0), degrees.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE, MAX_BLOCKS=MAX_BLOCKS, SCALE=SCALE,
+        num_warps=8, num_stages=3,
     )
-    return o, lse
+
+    return o_flat.reshape(batch_size, num_heads, t_max, head_dim), lse_flat.reshape(batch_size, num_heads, t_max)
 
 
 def _pytorch_block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
@@ -278,26 +285,40 @@ def setup(suite_specs, device, variants):
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
 
-    seen = set()
+    max_blocks_needed = set()
+    seen_shapes = set()
     for spec in suite_specs:
-        key = (spec.batch_size, spec.num_heads, spec.t_max)
-        if key in seen:
-            continue
-        seen.add(key)
+        upper = spec.window_blocks + spec.global_blocks + spec.retrieval_blocks
+        mb = 1
+        while mb < upper:
+            mb *= 2
+        mb = min(mb, 32)
+        max_blocks_needed.add(max(mb, 1))
 
-        b, h, t = spec.batch_size, spec.num_heads, spec.t_max
-        q = torch.randn(b, h, t, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-        nqb = t // BLOCK_SIZE
-        rp = torch.zeros(b, h, nqb + 1, dtype=torch.int32, device="cuda")
-        for i in range(nqb):
-            rp[:, :, i + 1] = rp[:, :, i] + 1
-        ci = torch.zeros(b, h, nqb, dtype=torch.int32, device="cuda")
-        for i in range(nqb):
-            ci[:, :, i] = i
-        sl = torch.full((b,), t, dtype=torch.int32, device="cuda")
-        block_sparse_attn_fwd(q, k, v, rp, ci, sl)
-        torch.cuda.synchronize()
-        del q, k, v, rp, ci, sl
-        torch.cuda.empty_cache()
+        shape_key = (spec.batch_size, spec.num_heads, spec.t_max)
+        seen_shapes.add(shape_key)
+
+    for (b, h, t) in seen_shapes:
+        for mb in max_blocks_needed:
+            nqb = t // BLOCK_SIZE
+            q = torch.randn(b, h, t, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+
+            batch_heads = b * h
+            actual_deg = min(mb, nqb)
+            rp = torch.zeros(b, h, nqb + 1, dtype=torch.int32, device="cuda")
+            for i in range(nqb):
+                rp[:, :, i + 1] = rp[:, :, i] + actual_deg
+            total_nnz = nqb * actual_deg
+            ci = torch.zeros(b, h, total_nnz, dtype=torch.int32, device="cuda")
+            for i in range(nqb):
+                for d in range(actual_deg):
+                    block_idx = max(0, i - d)
+                    ci[:, :, i * actual_deg + d] = block_idx
+            sl = torch.full((b,), t, dtype=torch.int32, device="cuda")
+
+            block_sparse_attn_fwd(q, k, v, rp, ci, sl)
+            torch.cuda.synchronize()
+            del q, k, v, rp, ci, sl
+            torch.cuda.empty_cache()
