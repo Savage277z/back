@@ -273,7 +273,7 @@ def block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
 
 
 def setup(suite_specs, device, variants):
-    if str(device) != "cuda" or not torch.cuda.is_available():
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
 
     seen = set()
