@@ -29,6 +29,7 @@ def _block_sparse_attn_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SCALE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     bh = pid // num_q_blocks
@@ -149,6 +150,7 @@ def _triton_block_sparse_attn_fwd(q, k, v, row_ptr, col_idx, seq_lens):
         num_q_blocks=num_q_blocks,
         max_nnz=max_nnz,
         BLOCK_M=128, BLOCK_N=128, BLOCK_D=128,
+        SCALE=SCALE,
         num_warps=4, num_stages=2,
     )
     return o, lse
