@@ -3,7 +3,7 @@ import os
 import math
 
 sys.path.insert(0, "/home/attention-kernel-challenge")
-sys.path.insert(0, "/home/back/submission")
+sys.path.insert(0, "/home/back")
 
 import torch
 import numpy as np
